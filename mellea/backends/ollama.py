@@ -18,7 +18,12 @@ from mellea.backends.tools import (
     add_tools_from_model_options,
 )
 from mellea.backends.types import ModelOption
-from mellea.helpers.async_helpers import send_to_queue
+from mellea.helpers.async_helpers import (
+    ClientCache,
+    get_current_event_loop,
+    send_to_queue,
+)
+from mellea.helpers.event_loop_helper import _run_async_in_thread
 from mellea.helpers.fancy_logger import FancyLogger
 from mellea.stdlib.base import (
     CBlock,
@@ -31,6 +36,8 @@ from mellea.stdlib.base import (
 )
 from mellea.stdlib.chat import Message
 from mellea.stdlib.requirement import ALoraRequirement
+
+format: None = None  # typing this variable in order to shadow the global format function and ensure mypy checks for errors
 
 
 class OllamaModelBackend(FormatterBackend):
@@ -68,6 +75,11 @@ class OllamaModelBackend(FormatterBackend):
         # Setup the client and ensure that we have the model available.
         self._base_url = base_url
         self._client = ollama.Client(base_url)
+
+        self._client_cache = ClientCache(2)
+
+        # Call once to set up an async client and prepopulate the cache.
+        _ = self._async_client
 
         if not self._check_ollama_server():
             err = f"could not create OllamaModelBackend: ollama server not running at {base_url}"
@@ -181,6 +193,17 @@ class OllamaModelBackend(FormatterBackend):
         except ollama.ResponseError:
             return False
 
+    @property
+    def _async_client(self) -> ollama.AsyncClient:
+        """Ollama's client gets tied to a specific event loop. Reset it if needed here."""
+        key = id(get_current_event_loop())
+
+        _async_client = self._client_cache.get(key)
+        if _async_client is None:
+            _async_client = ollama.AsyncClient(self._base_url)
+            self._client_cache.put(key, _async_client)
+        return _async_client
+
     def _simplify_and_merge(
         self, model_options: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -245,7 +268,7 @@ class OllamaModelBackend(FormatterBackend):
         mot = self.generate_from_chat_context(
             action,
             ctx,
-            format=format,
+            _format=format,
             model_options=model_options,
             tool_calls=tool_calls,
         )
@@ -257,7 +280,7 @@ class OllamaModelBackend(FormatterBackend):
         action: Component | CBlock,
         ctx: Context,
         *,
-        format: type[BaseModelSubclass] | None = None,
+        _format: type[BaseModelSubclass] | None = None,
         model_options: dict | None = None,
         tool_calls: bool = False,
     ) -> ModelOutputThunk:
@@ -305,7 +328,7 @@ class OllamaModelBackend(FormatterBackend):
         # Append tool call information if applicable.
         tools: dict[str, Callable] = dict()
         if tool_calls:
-            if format:
+            if _format:
                 FancyLogger.get_logger().warning(
                     f"Tool calling typically uses constrained generation, but you have specified a `format` in your generate call. NB: tool calling is superseded by format; we will NOT call tools for your request: {action}"
                 )
@@ -318,20 +341,17 @@ class OllamaModelBackend(FormatterBackend):
                 add_tools_from_context_actions(tools, [action])
             FancyLogger.get_logger().info(f"Tools for call: {tools.keys()}")
 
-        # Ollama ties its async client to an event loop so we have to create it here.
-        async_client = ollama.AsyncClient(self._base_url)
-
         # Generate a chat response from ollama, using the chat messages. Can be either type since stream is passed as a model option.
         chat_response: Coroutine[
             Any, Any, AsyncIterator[ollama.ChatResponse] | ollama.ChatResponse
-        ] = async_client.chat(
+        ] = self._async_client.chat(
             model=self._get_ollama_model_id(),
             messages=conversation,
             tools=list(tools.values()),
             think=model_opts.get(ModelOption.THINKING, None),
             stream=model_opts.get(ModelOption.STREAM, False),
             options=self._make_backend_specific_and_remove(model_opts),
-            format=format.model_json_schema() if format is not None else None,
+            format=_format.model_json_schema() if _format is not None else None,
         )  # type: ignore
 
         output = ModelOutputThunk(None)
@@ -343,7 +363,10 @@ class OllamaModelBackend(FormatterBackend):
         # each processing step.
         output._process = functools.partial(self.processing, tools=tools)
         output._post_process = functools.partial(
-            self.post_processing, conversation=conversation, tools=tools, format=format
+            self.post_processing,
+            conversation=conversation,
+            tools=tools,
+            _format=_format,
         )
 
         try:
@@ -382,28 +405,26 @@ class OllamaModelBackend(FormatterBackend):
         # See https://github.com/ollama/ollama/blob/main/docs/faq.md#how-does-ollama-handle-concurrent-requests.
         prompts = [self.formatter.print(action) for action in actions]
 
-        async def get_response(coroutines):
+        async def get_response():
+            # Run async so that we can make use of Ollama's concurrency.
+            coroutines: list[Coroutine[Any, Any, ollama.GenerateResponse]] = []
+            for prompt in prompts:
+                co = self._async_client.generate(
+                    model=self._get_ollama_model_id(),
+                    prompt=prompt,
+                    raw=True,
+                    think=model_opts.get(ModelOption.THINKING, None),
+                    format=format.model_json_schema() if format is not None else None,
+                    options=self._make_backend_specific_and_remove(model_opts),
+                )
+                coroutines.append(co)
+
             responses = await asyncio.gather(*coroutines, return_exceptions=True)
             return responses
 
-        async_client = ollama.AsyncClient(self._base_url)
-        # Run async so that we can make use of Ollama's concurrency.
-        coroutines = []
-        for prompt in prompts:
-            co = async_client.generate(
-                model=self._get_ollama_model_id(),
-                prompt=prompt,
-                raw=True,
-                think=model_opts.get(ModelOption.THINKING, None),
-                format=format.model_json_schema() if format is not None else None,
-                options=self._make_backend_specific_and_remove(model_opts),
-            )
-            coroutines.append(co)
-
-        # Revisit this once we start using async elsewhere. Only one asyncio event
-        # loop can be running in a given thread.
-        responses: list[ollama.GenerateResponse | BaseException] = asyncio.run(
-            get_response(coroutines)
+        # Run in the same event_loop like other Mellea async code called from a sync function.
+        responses: list[ollama.GenerateResponse | BaseException] = _run_async_in_thread(
+            get_response()
         )
 
         results = []
@@ -506,7 +527,7 @@ class OllamaModelBackend(FormatterBackend):
         mot: ModelOutputThunk,
         conversation: list[dict],
         tools: dict[str, Callable],
-        format,
+        _format,
     ):
         """Called when generation is done."""
         assert mot._action is not None, (
@@ -525,7 +546,7 @@ class OllamaModelBackend(FormatterBackend):
         generate_log.date = datetime.datetime.now()
         generate_log.model_output = mot._meta["chat_response"]
         generate_log.extra = {
-            "format": format,
+            "format": _format,
             "thinking": mot._model_options.get(ModelOption.THINKING, None),
             "tools_available": tools,
             "tools_called": mot.tool_calls,
