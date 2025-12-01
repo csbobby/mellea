@@ -17,6 +17,7 @@ from .prompt_modules import (
     subtask_prompt_generator,
     validation_code_generator,
     validation_decision,
+    validation_report,
 )
 from .prompt_modules.subtask_constraint_assign import SubtaskPromptConstraintsItem
 from .prompt_modules.subtask_list import SubtaskItem
@@ -26,6 +27,7 @@ from .prompt_modules.subtask_prompt_generator import SubtaskPromptItem
 class ConstraintValData(TypedDict):
     val_strategy: Literal["code", "llm"]
     val_fn: str | None
+    val_report: str | None
 
 
 class ConstraintResult(TypedDict):
@@ -33,6 +35,7 @@ class ConstraintResult(TypedDict):
     val_strategy: Literal["code", "llm"]
     val_fn: str | None
     val_fn_name: str
+    val_report: str | None
 
 
 class DecompSubtasksResult(TypedDict):
@@ -137,14 +140,22 @@ def decompose(
     constraint_val_data: dict[str, ConstraintValData] = {}
 
     for cons_key in constraint_val_strategy:
-        constraint_val_data[cons_key] = {
-            "val_strategy": constraint_val_strategy[cons_key]["val_strategy"],
-            "val_fn": None,
-        }
+        constraint_val_data[cons_key] = ConstraintValData(
+            val_strategy=constraint_val_strategy[cons_key]["val_strategy"],
+            val_fn=None,
+            val_report=None,
+        )
+
+        # Generate validation code if strategy == "code"
         if constraint_val_data[cons_key]["val_strategy"] == "code":
             constraint_val_data[cons_key]["val_fn"] = (
                 validation_code_generator.generate(m_session, cons_key).parse()
             )
+        # Generate validation report schema (for both strategies)
+        # This prompt module can encode the desired FailureCauseReport / trackback for this constraint.
+        constraint_val_data[cons_key]["val_report"] = validation_report.generate(
+            m_session, cons_key
+        ).parse()
 
     subtask_prompts: list[SubtaskPromptItem] = subtask_prompt_generator.generate(
         m_session,
@@ -166,17 +177,13 @@ def decompose(
             subtask=subtask_data.subtask,
             tag=subtask_data.tag,
             constraints=[
-                {
-                    "constraint": cons_str,
-                    "val_strategy": constraint_val_data[cons_str]["val_strategy"],
-                    "val_fn_name": f"val_fn_{task_prompt_constraints.index(cons_str) + 1}",
-                    # >> Always include generated "val_fn" code (experimental)
-                    "val_fn": constraint_val_data[cons_str]["val_fn"],
-                    # >> Include generated "val_fn" code only for the last subtask (experimental)
-                    # "val_fn": constraint_val_data[cons_str]["val_fn"]
-                    # if subtask_i + 1 == len(subtask_prompts_with_constraints)
-                    # else None,
-                }
+                ConstraintResult(
+                    constraint=cons_str,
+                    val_strategy=constraint_val_data[cons_str]["val_strategy"],
+                    val_fn_name=f"val_fn_{task_prompt_constraints.index(cons_str) + 1}",
+                    val_fn=constraint_val_data[cons_str]["val_fn"],
+                    val_report=constraint_val_data[cons_str]["val_report"],
+                )
                 for cons_str in subtask_data.constraints
             ],
             prompt_template=subtask_data.prompt_template,
@@ -213,12 +220,13 @@ def decompose(
         original_task_prompt=task_prompt,
         subtask_list=[item.subtask for item in subtasks],
         identified_constraints=[
-            {
-                "constraint": cons_str,
-                "val_strategy": constraint_val_data[cons_str]["val_strategy"],
-                "val_fn": constraint_val_data[cons_str]["val_fn"],
-                "val_fn_name": f"val_fn_{cons_i + 1}",
-            }
+            ConstraintResult(
+                constraint=cons_str,
+                val_strategy=constraint_val_data[cons_str]["val_strategy"],
+                val_fn=constraint_val_data[cons_str]["val_fn"],
+                val_fn_name=f"val_fn_{cons_i + 1}",
+                val_report=constraint_val_data[cons_str]["val_report"],
+            )
             for cons_i, cons_str in enumerate(task_prompt_constraints)
         ],
         subtasks=decomp_subtask_result,
