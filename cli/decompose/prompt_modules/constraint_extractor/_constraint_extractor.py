@@ -66,6 +66,7 @@ class _ConstraintExtractor(PromptModule):
         return [
             line.strip()[2:] if line.strip()[:2] == "- " else line.strip()
             for line in constraint_extractor_str.splitlines()
+             # TODO: doesn't work when the generated constraint_extractor_str doesn't include linebreaks.
         ]
 
     def generate(  # type: ignore[override]
