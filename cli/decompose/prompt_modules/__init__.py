@@ -11,3 +11,4 @@ from .validation_code_generator import (
     validation_code_generator as validation_code_generator,
 )
 from .validation_decision import validation_decision as validation_decision
+from .validation_report_generator import validation_report_generator as validation_report_generator
