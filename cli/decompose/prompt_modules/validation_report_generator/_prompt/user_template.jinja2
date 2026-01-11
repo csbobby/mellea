@@ -1,10 +1,15 @@
-Now, here is the constraint/requirement for which you must design
-a validation report schema:
+Now, here is the constraint/requirement, subtask prompt, subtask result for you to analyze if the subtask result satisfy the constraint/requirement:
 
 <constraint_requirement>
 {{ constraint_requirement }}
 </constraint_requirement>
 
-Please return the validation report schema inside the
-<validation_report> tags as a JSON-like object that follows the
-instructions in the system prompt.
+<subtask_prompt>
+{{ subtask_prompt }}
+</subtask_prompt>
+
+<subtask_result>
+{{ subtask_result }}
+</subtask_result>
+
+Please output the JSON object strictly inside <validation_report> tags following the instructions in the system prompt.
