@@ -1,3 +1,4 @@
+# decompose.py
 import json
 import keyword
 import re
@@ -11,12 +12,11 @@ import typer
 from .pipeline import DecompBackend, DecompPipelineResult, DecompSubtasksResult
 
 
-# Must maintain declaration order
-# Newer versions must be declared on the bottom
 class DecompVersion(str, Enum):
     latest = "latest"
     v1 = "v1"
-    # v2 = "v2"
+    v2 = "v2"
+    # v3 = "v3"
 
 
 this_file_dir = Path(__file__).resolve().parent
@@ -242,6 +242,21 @@ def run(
             )
         ),
     ] = None,
+    execute_subtasks: Annotated[
+        bool,
+        typer.Option(
+            help="If set, execute subtasks in decompose() and generate runtime validation reports."
+        ),
+    ] = False,
+    debug_dir: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Optional directory to save debug dumps when LLM tag parsing fails "
+                "(task, subtask, raw LLM output, traceback). If not set, no debug files are written."
+            )
+        ),
+    ] = None,
 ) -> None:
     """Runs the decomposition pipeline."""
     try:
@@ -277,6 +292,9 @@ def run(
                 'One or more of the "input-var" are not valid. The input variables\' names must be a valid Python identifier'
             )
 
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
         if prompt_file:
             decomp_data = pipeline.decompose(
                 task_prompt=prompt_file.read(),
@@ -286,6 +304,8 @@ def run(
                 backend_req_timeout=backend_req_timeout,
                 backend_endpoint=backend_endpoint,
                 backend_api_key=backend_api_key,
+                execute_subtasks=execute_subtasks,
+                debug_dir=debug_dir,
             )
         else:
             task_prompt: str = typer.prompt(
@@ -305,11 +325,22 @@ def run(
                 backend_req_timeout=backend_req_timeout,
                 backend_endpoint=backend_endpoint,
                 backend_api_key=backend_api_key,
+                execute_subtasks=execute_subtasks,
+                debug_dir=debug_dir,
             )
 
-        # Verify that all user variables are properly defined before use
-        # This may reorder subtasks if dependencies are out of order
-        decomp_data = verify_user_variables(decomp_data, input_var)
+        decomp_dir = out_dir / out_name
+        decomp_dir.mkdir(parents=True, exist_ok=True)
+
+        val_fn_dir = decomp_dir / "validations"
+        val_fn_dir.mkdir(parents=True)
+
+        (val_fn_dir / "__init__.py").touch()
+
+        for constraint in decomp_data["identified_constraints"]:
+            if constraint["val_fn"] is not None:
+                with open(val_fn_dir / f"{constraint['val_fn_name']}.py", "w") as f:
+                    f.write(constraint["val_fn"] + "\n")
 
         with open(out_dir / f"{out_name}.json", "w") as f:
             json.dump(decomp_data, f, indent=2)
@@ -322,12 +353,15 @@ def run(
                 + "\n"
             )
     except Exception:
-        created_json = Path(out_dir / f"{out_name}.json")
-        created_py = Path(out_dir / f"{out_name}.py")
-
-        if created_json.exists() and created_json.is_file():
-            created_json.unlink()
-        if created_py.exists() and created_py.is_file():
-            created_py.unlink()
+        decomp_dir = out_dir / out_name
+        if decomp_dir.exists() and decomp_dir.is_dir():
+            shutil.rmtree(decomp_dir)
 
         raise Exception
+
+
+# python -m cli.decompose.run \
+#   --out-dir output/ \
+#   --out-name test \
+#   --prompt-file task.txt \
+#   --debug-dir output/test/_debug

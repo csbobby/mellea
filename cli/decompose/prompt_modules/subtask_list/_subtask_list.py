@@ -20,24 +20,23 @@ from ._types import SubtaskItem
 T = TypeVar("T")
 
 RE_SUBTASK_AND_TAG = re.compile(
-    r"(.*\S)\s*.\s*Variable\s*:\s*(\w+)", flags=re.IGNORECASE
+    r"^\s*(?:\d+\.\s*)?(.*\S)\s*-\s*(?i:Variable)\s*:\s*([A-Z][A-Z0-9_]*)\s*$"
 )
 RE_FINAL_SUBTASK_LIST = re.compile(
-    r"<subtask_list>(.+?)</subtask_list>", flags=re.IGNORECASE | re.DOTALL
+    r"<subtask_list\s*>\s*(.+?)\s*</subtask_list\s*>",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 
 def _parse_subtask_list_line(line: str) -> tuple[str, str]:
-    matches = re.match(RE_SUBTASK_AND_TAG, line)
-    try:
-        subtask: str | None = matches.group(1).strip() if matches is not None else None
-        tag: str | None = matches.group(2).strip() if matches is not None else None
-        assert type(subtask) is str and len(subtask) > 0
-        assert type(tag) is str and len(tag) > 0
-    except (IndexError, AssertionError):
+    matches = RE_SUBTASK_AND_TAG.match(line)
+    if not matches:
         raise SubtaskLineParseError(f'Wrong subtask line format: "{line}"')
-
-    return (subtask, tag)
+    subtask = matches.group(1).strip()
+    tag = matches.group(2).strip()
+    if not subtask or not tag:
+        raise SubtaskLineParseError(f'Wrong subtask line format: "{line}"')
+    return subtask, tag
 
 
 @final
@@ -74,10 +73,10 @@ class _SubtaskList(PromptModule):
         Raises:
             TagExtractionError: An error occurred trying to extract content from the
                 generated output. The LLM probably failed to open and close
-                the \<final_subtask_list\> tags.
+                the \<subtask_list\> tags.
             SubtaskLineParseError: An error occurred trying to parse the subtask line.
                 The LLM probably failed to generate the expected format inside
-                the \<final_subtask_list\> tags.
+                the \<subtask_list\> tags.
         """
         subtask_list_match = re.search(RE_FINAL_SUBTASK_LIST, generated_str)
 
@@ -87,18 +86,28 @@ class _SubtaskList(PromptModule):
 
         if subtask_list_str is None:
             raise TagExtractionError(
-                'LLM failed to generate correct tags for extraction: "<final_subtask_list>"'
+                'LLM failed to generate correct tags for extraction: "<subtask_list>"'
             )
 
-        subtask_list_lines = [line.strip() for line in subtask_list_str.splitlines()]
+        # Instead of splitlines(), extract numbered items robustly.
+        # Each item: "1. .... - Variable: TAG"
+        item_re = re.compile(
+            r"(?:^|\r?\n)\s*\d+\.\s*.*?(?=(?:\r?\n\s*\d+\.\s*)|\Z)",
+            flags=re.DOTALL,
+        )
+
+        subtask_list_lines = [m.group(0).strip() for m in item_re.finditer(subtask_list_str)]
+
+        # Fallback: if the model actually followed the "single-line" rule perfectly,
+        # item_re still works. If it failed and produced non-numbered lines, keep old behavior.
+        if not subtask_list_lines:
+            subtask_list_lines = [line.strip() for line in subtask_list_str.splitlines() if line.strip()]
 
         try:
-            subtask_tag_list = [
-                _parse_subtask_list_line(line) for line in subtask_list_lines
-            ]
-        except AssertionError:
+            subtask_tag_list = [_parse_subtask_list_line(line) for line in subtask_list_lines]
+        except SubtaskLineParseError as e:
             raise SubtaskLineParseError(
-                "Failed parsing a subtask line from the <final_subtask_list> tags"
+                f"Failed parsing a subtask line from the <subtask_list> tags: {e}"
             )
 
         return [SubtaskItem(subtask=item[0], tag=item[1]) for item in subtask_tag_list]

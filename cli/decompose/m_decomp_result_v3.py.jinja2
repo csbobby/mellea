@@ -1,0 +1,144 @@
+{% if user_inputs -%}
+import os
+{% endif -%}
+import json
+import textwrap
+import traceback
+
+import mellea
+
+from prompt_modules.validation_report_generator import validation_report_generator
+
+{%- if (identified_constraints | selectattr("val_strategy", "equalto", "code") | list | length) > 0 %}
+from mellea.stdlib.requirement import req
+{% for c in identified_constraints %}
+{%- if c.val_fn %}
+from validations.{{ c.val_fn_name }} import validate_input as {{ c.val_fn_name }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+
+m = mellea.start_session()
+
+validation_report_data = {
+{%- for c in identified_constraints %}
+    {{ c.constraint | tojson }}: {
+        "is_valid": None,
+        "error_type": None,
+        "error_trackback": None,
+        "failure_cause": None,
+        "failure_trackback": None,
+    },
+{%- endfor %}
+}
+
+{%- if user_inputs %}
+
+
+# User Input Variables
+try:
+    {%- for var in user_inputs %}
+    {{ var | lower }} = os.environ["{{ var | upper }}"]
+    {%- endfor %}
+except KeyError as e:
+    print(f"ERROR: One or more required environment variables are not set; {e}")
+    exit(1)
+{%- endif %}
+
+{%- for item in subtasks %}
+
+
+{{ item.tag | lower }}_gnrl = textwrap.dedent(
+    R"""
+    {{ item.general_instructions | trim | indent(width=4, first=False) }}
+    """.strip()
+)
+{{ item.tag | lower }} = m.instruct(
+    {%- if not item.input_vars_required %}
+    {{ item.subtask[3:] | trim | tojson }},
+    {%- else %}
+    textwrap.dedent(
+        R"""
+        {{ item.subtask[3:] | trim }}
+
+        Here are the input variables and their content:
+        {%- for var in item.input_vars_required %}
+
+        - {{ var | upper }} = {{ "{{" }}{{ var | upper }}{{ "}}" }}
+        {%- endfor %}
+        """.strip()
+    ),
+    {%- endif %}
+    {%- if item.constraints %}
+    requirements=[
+        {%- for c in item.constraints %}
+        {%- if c.val_fn %}
+        req(
+            {{ c.constraint | tojson}},
+            validation_fn={{ c.val_fn_name }},
+        ),
+        {%- else %}
+        {{ c.constraint | tojson}},
+        {%- endif %}
+        {%- endfor %}
+    ],
+    {%- else %}
+    requirements=None,
+    {%- endif %}
+    {%- if item.input_vars_required %}
+    user_variables={
+        {%- for var in item.input_vars_required %}
+        {{ var | upper | tojson }}: {{ var | lower }},
+        {%- endfor %}
+    },
+    {%- endif %}
+    grounding_context={
+        "GENERAL_INSTRUCTIONS": {{ item.tag | lower }}_gnrl,
+        {%- for var in item.depends_on %}
+        {{ var | upper | tojson }}: {{ var | lower }}.value,
+        {%- endfor %}
+    },
+)
+assert {{ item.tag | lower }}.value is not None, 'ERROR: task "{{ item.tag | lower }}" execution failed'
+
+# Runtime validation reports for constraints in this subtask
+{%- for c in item.constraints %}
+{%- if c.val_strategy == "llm" %}
+try:
+    _r = validation_report_generator.generate(
+        m.session,  # mellea session
+        constraint_requirement={{ c.constraint | tojson }},
+        subtask_prompt={{ item.prompt_template | tojson }},
+        subtask_result={{ item.tag | lower }}.value,
+    ).parse()
+    validation_report_data[{{ c.constraint | tojson }}].update(_r)
+except Exception as e:
+    validation_report_data[{{ c.constraint | tojson }}]["is_valid"] = None
+    validation_report_data[{{ c.constraint | tojson }}]["error_type"] = type(e).__name__
+    validation_report_data[{{ c.constraint | tojson }}]["error_trackback"] = str(e)
+{%- else %}
+# code strategy: run val_fn on subtask_result
+try:
+    _is_valid = {{ c.val_fn_name }}({{ item.tag | lower }}.value)
+    if _is_valid not in (True, False, None):
+        _is_valid = None
+    validation_report_data[{{ c.constraint | tojson }}]["is_valid"] = _is_valid
+except Exception as e:
+    validation_report_data[{{ c.constraint | tojson }}]["is_valid"] = None
+    validation_report_data[{{ c.constraint | tojson }}]["error_type"] = type(e).__name__
+    validation_report_data[{{ c.constraint | tojson }}]["error_trackback"] = traceback.format_exc()
+{%- endif %}
+{%- endfor %}
+
+{%- if loop.last %}
+
+
+final_answer = {{ item.tag | lower }}.value
+
+# Write validation reports to a sidecar file
+with open("validation_report_data.json", "w") as f:
+    json.dump(validation_report_data, f, indent=2)
+
+print(final_answer)
+{%- endif -%}
+{%- endfor -%}

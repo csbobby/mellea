@@ -1,6 +1,8 @@
 import re
 from collections.abc import Callable, Sequence
 from typing import TypedDict, TypeVar, cast, final
+from pathlib import Path
+from datetime import datetime
 
 from typing_extensions import Unpack
 
@@ -25,6 +27,13 @@ RE_SUBTASK_PROMPT = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 
+def _dbg_append(debug_file: Path, title: str, content: str) -> None:
+    debug_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(debug_file, "a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"{datetime.utcnow().isoformat()}Z | {title}\n")
+        f.write("-" * 100 + "\n")
+        f.write((content or "").rstrip() + "\n")
 
 class SubtaskPromptGeneratorArgs(TypedDict):
     subtasks_and_tags: Sequence[tuple[str, str]]
@@ -99,9 +108,14 @@ class _SubtaskPromptGenerator(PromptModule):
             )
 
             if generated_prompt_template is None:
+                raw_preview = data[2]
+                if len(raw_preview) > 1000:
+                    raw_preview = raw_preview[:1000] + "\n... <TRUNCATED> ..."
                 raise TagExtractionError(
                     f'Error while processing the subtask: "{data[0]}"\n'
-                    + 'LLM failed to generate correct tags for extraction: "<subtask_prompt_template>"'
+                    + 'LLM failed to generate correct tags for extraction: "<subtask_prompt_template>"\n'
+                    + "---- RAW OUTPUT (truncated) ----\n"
+                    + raw_preview
                 )
 
             result.append(
@@ -127,7 +141,8 @@ class _SubtaskPromptGenerator(PromptModule):
         max_new_tokens: int = 4096,
         parser: Callable[[str], T] = _default_parser,  # type: ignore[assignment]
         # About the mypy ignore statement above: https://github.com/python/mypy/issues/3737
-        user_input_var_names: list[str] = [],
+        user_input_var_names: list[str] | None = None,
+        debug_dir: Path | None = None,
         **kwargs: Unpack[SubtaskPromptGeneratorArgs],
     ) -> PromptModuleString[T]:
         """Generates prompt templates for a list of subtasks based on the task that originated
@@ -182,6 +197,13 @@ class _SubtaskPromptGenerator(PromptModule):
         """
         assert input_str is not None, 'This module requires the "input_str" argument'
 
+        debug_file: Path | None = None
+        if debug_dir is not None:
+            debug_file = debug_dir / "subtask_prompt_generator.debug.log"
+            _dbg_append(debug_file, "TASK_PROMPT", input_str or "")
+        if user_input_var_names is None:
+            user_input_var_names = []
+
         user_input_variables_exists = True if user_input_var_names else False
         system_prompt = get_system_prompt(
             user_input_variables_exists=user_input_variables_exists
@@ -214,6 +236,12 @@ class _SubtaskPromptGenerator(PromptModule):
                 available_content_variables=available_content_variables,
                 target_subtask=subtask_tag[0],
             )
+            if debug_file is not None:
+                _dbg_append(
+                    debug_file,
+                    f"SUBTASK[{i}] tag={subtask_tag[1]} | USER_PROMPT",
+                    user_prompt,
+                )
 
             action = Message("user", user_prompt)
 
@@ -226,6 +254,14 @@ class _SubtaskPromptGenerator(PromptModule):
                         ModelOption.MAX_NEW_TOKENS: max_new_tokens,
                     },
                 ).value
+                
+                if debug_file is not None:
+                    _dbg_append(
+                        debug_file,
+                        f"SUBTASK[{i}] tag={subtask_tag[1]} | RAW_LLM_OUTPUT",
+                        gen_result,
+                    )
+
             except Exception as e:
                 raise BackendGenerationError(f"LLM generation failed: {e}")
 
